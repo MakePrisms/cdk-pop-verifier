@@ -1,24 +1,43 @@
-//! Axum middleware that gates a route behind a NUT-24 PoP challenge.
+//! Axum middleware that gates a route behind an MPP-Cashu PoP challenge.
 //!
 //! Drop into an `axum::Router` with [`axum::middleware::from_fn_with_state`]
 //! to enforce the v1 happy path:
 //!
-//! 1. Request arrives without an `X-Cashu` header — middleware responds
-//!    `402 Payment Required` and places the encoded
-//!    [`PopRequirement`][crate::PopRequirement] into the response's
-//!    `X-Cashu` header (the `creqA...` form per NUT-24).
-//! 2. Client retries the same URL and method with `X-Cashu:
-//!    cashuB...<token>` — middleware decodes the token, runs the full
-//!    [`PopValidator`] pipeline, and on success attaches a
-//!    [`ValidatedPop`] to `request.extensions_mut()` so the downstream
-//!    handler can read it via `Extension<ValidatedPop>`. On failure
-//!    the middleware writes a structured HTTP error per the NUT-24
-//!    "Errors" section.
+//! 1. Request arrives without an `Authorization: Payment method="cashu"`
+//!    header — middleware responds `402 Payment Required` and places
+//!    `WWW-Authenticate: Payment method="cashu", challenge="creqA…"` on
+//!    the response. The `challenge` value is the standard NUT-18
+//!    [`PopRequirement`][crate::PopRequirement] in its canonical
+//!    `creqA…` encoding.
+//! 2. Client retries the same URL and method with `Authorization:
+//!    Payment method="cashu", token="cashuB…"` — middleware decodes the
+//!    token, runs the full [`PopValidator`] pipeline, and on success
+//!    attaches a [`ValidatedPop`] to `request.extensions_mut()` so the
+//!    downstream handler can read it via `Extension<ValidatedPop>`. On
+//!    failure the middleware writes a structured HTTP error per the
+//!    NUT-24 "Errors" section.
 //!
-//! Per the v1 lock-ins this commit ships only the bearer arm: no
-//! `WWW-Authenticate: Payment` (MPP-Cashu) is emitted alongside the
-//! 402, and there is no separate `/pay` endpoint. The same URL + method
-//! that produced the 402 is what the client retries with the proof.
+//! ## MPP-Cashu envelope
+//!
+//! The envelope follows RFC 7235's `auth-scheme + auth-param*` shape:
+//!
+//! ```text
+//! HTTP/1.1 402 Payment Required
+//! WWW-Authenticate: Payment method="cashu", challenge="creqA…"
+//!
+//! GET /resource
+//! Authorization: Payment method="cashu", token="cashuB…"
+//! ```
+//!
+//! The MPP-Cashu *method extension* itself is not yet formalized in the
+//! MPP spec at <https://mpp.dev>; the shape here is gudnuf's tentative
+//! pre-spec form. The `creqA…` and `cashuB…` payloads are unchanged
+//! from the standalone NUT-24 path — only the framing changed.
+//!
+//! Per the v1 lock-ins this middleware is MPP-only: no `X-Cashu` header
+//! is read or emitted, and there is no separate `/pay` endpoint. The
+//! same URL + method that produced the 402 is what the client retries
+//! with the proof.
 
 use std::sync::Arc;
 
@@ -29,14 +48,14 @@ use axum::{
 };
 use http::{header::HeaderValue, StatusCode};
 
+use crate::auth_header::{
+    parse_payment_authorization, AuthParseError, CASHU_METHOD, CHALLENGE_PARAM, METHOD_PARAM,
+    PAYMENT_SCHEME,
+};
 use crate::challenge::{decode_token, encode_challenge, PopRequirement};
 use crate::error::Error as ChallengeError;
 use crate::mint_client::MintClient;
 use crate::validator::{PopValidator, ValidationError};
-
-/// The HTTP header NUT-24 uses for both the challenge (server → client)
-/// and the proof presentation (client → server).
-const X_CASHU: &str = "x-cashu";
 
 /// State the middleware needs at request time: the [`PopRequirement`]
 /// to advertise on 402 and the [`PopValidator`] that validates proofs
@@ -49,10 +68,11 @@ const X_CASHU: &str = "x-cashu";
 #[derive(Debug)]
 pub struct PopMiddlewareState<M: MintClient> {
     /// What the verifier requires from the holder. Emitted as the
-    /// `creqA...` value of the `X-Cashu` header on the 402.
+    /// `challenge="creqA…"` parameter of `WWW-Authenticate: Payment`
+    /// on the 402.
     pub requirement: PopRequirement,
     /// Validator the middleware delegates to once the client retries
-    /// with an `X-Cashu` proof header.
+    /// with an `Authorization: Payment` proof header.
     pub validator: Arc<PopValidator<M>>,
 }
 
@@ -67,7 +87,8 @@ impl<M: MintClient> PopMiddlewareState<M> {
     }
 }
 
-/// Axum middleware entry point: enforces NUT-24 PoP on the request.
+/// Axum middleware entry point: enforces the MPP-Cashu PoP envelope on
+/// the request.
 ///
 /// Register with `axum::middleware::from_fn_with_state(state, require_pop)`
 /// where `state` is `Arc<PopMiddlewareState<M>>`. The `'static` bound on
@@ -82,61 +103,100 @@ pub async fn require_pop<M>(
 where
     M: MintClient + 'static,
 {
-    // Step 1: client must present the X-Cashu header. No header → 402
-    // with the encoded challenge in the response's X-Cashu.
-    let Some(header_raw) = req.headers().get(X_CASHU) else {
+    // Step 1: client must present an `Authorization: Payment …` header.
+    // Missing header or any non-`Payment` scheme is treated as "no PoP
+    // attempt" → 402 with the encoded challenge. This matches RFC 7235
+    // §3.1 semantics: a 402 advertises which schemes the resource
+    // accepts; clients that try a different scheme effectively didn't
+    // try.
+    let Some(header_raw) = req.headers().get(http::header::AUTHORIZATION) else {
         return challenge_response(&ctx.requirement);
     };
 
-    // Step 2: header must be valid UTF-8. Per RFC 7230 header values are
-    // ASCII; a non-UTF-8 value never carries a valid cashu token, so we
-    // surface 400 rather than treating it as "no header".
+    // Step 2: header must be valid UTF-8. Per RFC 7230 header values
+    // are ASCII; a non-UTF-8 value never carries a valid Payment auth
+    // envelope, so we surface 400 rather than treating it as "no
+    // header".
     let header_value = match header_raw.to_str() {
         Ok(v) => v,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                "invalid X-Cashu header encoding",
+                "invalid Authorization header encoding",
             )
                 .into_response();
         }
     };
 
-    // Step 3: decode the token. `decode_token` already rejects empty
+    // Step 3: parse the MPP envelope. `UnknownScheme` is the one
+    // non-error error: it means "the client used Basic/Bearer/whatever
+    // — they didn't try MPP-Cashu", which is identical from a control-
+    // flow perspective to "no header at all". Every other parse error
+    // is "tried Payment but malformed" → 400.
+    let token_value = match parse_payment_authorization(header_value) {
+        Ok(t) => t,
+        Err(AuthParseError::UnknownScheme) => return challenge_response(&ctx.requirement),
+        Err(e) => return auth_parse_error_to_response(e),
+    };
+
+    // Step 4: decode the token. `decode_token` already rejects empty
     // input, unknown prefix, and malformed payload — we just propagate.
-    let token = match decode_token(header_value) {
+    let token = match decode_token(&token_value) {
         Ok(t) => t,
         Err(e) => return decode_error_to_response(e),
     };
 
-    // Step 4: run the full validator pipeline. Structural and mint-side
+    // Step 5: run the full validator pipeline. Structural and mint-side
     // failures both produce HTTP errors per NUT-24 §"Errors".
     let validated = match ctx.validator.validate(&token, &ctx.requirement).await {
         Ok(v) => v,
         Err(e) => return validation_error_to_response(e),
     };
 
-    // Step 5: hand the validated PoP to downstream handlers. They can
+    // Step 6: hand the validated PoP to downstream handlers. They can
     // extract it via `Extension<ValidatedPop>`.
     req.extensions_mut().insert(validated);
     next.run(req).await
 }
 
-/// Build a 402 response carrying the encoded challenge in `X-Cashu`.
+/// Build a 402 response carrying the encoded challenge in
+/// `WWW-Authenticate: Payment method="cashu", challenge="creqA…"`.
 fn challenge_response(requirement: &PopRequirement) -> Response {
     let encoded = encode_challenge(requirement);
-    match HeaderValue::from_str(&encoded) {
-        Ok(hv) => (StatusCode::PAYMENT_REQUIRED, [(X_CASHU, hv)]).into_response(),
-        // `encode_challenge` outputs `creqA...` which is base64url —
-        // strictly ASCII printable — so HeaderValue::from_str should
-        // not fail. Defensive fallback in case a future encoder change
-        // breaks that invariant.
+    // `encode_challenge` outputs `creqA…` which is base64url —
+    // strictly ASCII printable, no `"` or `\` to escape. Building the
+    // header value via plain concatenation is safe; we still call
+    // `HeaderValue::from_str` to enforce the ASCII invariant in case a
+    // future encoder change breaks it.
+    let header = format!(
+        r#"{} {}="{}", {}="{}""#,
+        PAYMENT_SCHEME, METHOD_PARAM, CASHU_METHOD, CHALLENGE_PARAM, encoded
+    );
+    match HeaderValue::from_str(&header) {
+        Ok(hv) => (
+            StatusCode::PAYMENT_REQUIRED,
+            [(http::header::WWW_AUTHENTICATE, hv)],
+        )
+            .into_response(),
+        // Defensive fallback — only triggers if the encoder regresses.
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to encode X-Cashu challenge header",
+            "failed to encode WWW-Authenticate challenge header",
         )
             .into_response(),
     }
+}
+
+/// Map an [`AuthParseError`] (from the MPP envelope parser) to an HTTP
+/// response. `UnknownScheme` is handled upstream (→ 402); the rest are
+/// client malformed-header errors → 400.
+fn auth_parse_error_to_response(e: AuthParseError) -> Response {
+    debug_assert!(
+        !matches!(e, AuthParseError::UnknownScheme),
+        "UnknownScheme must be handled upstream as 402"
+    );
+    let msg = format!("invalid Authorization: Payment header: {e}");
+    (StatusCode::BAD_REQUEST, msg).into_response()
 }
 
 /// Map a [`ChallengeError`] (from [`decode_token`]) to an HTTP response.
@@ -146,7 +206,7 @@ fn challenge_response(requirement: &PopRequirement) -> Response {
 /// clients can distinguish "wrong prefix" from "bad payload".
 fn decode_error_to_response(e: ChallengeError) -> Response {
     let msg = match &e {
-        ChallengeError::InvalidHeader(_) => format!("invalid X-Cashu header: {e}"),
+        ChallengeError::InvalidHeader(_) => format!("invalid token value: {e}"),
         ChallengeError::DecodeFailed(_) => format!("decode failed: {e}"),
         // EncodeFailed never originates from decode_token, but the
         // ChallengeError enum is shared — surface it as a 400 if it
@@ -195,7 +255,7 @@ mod tests {
     use cashu::nuts::Proof;
     use cashu::secret::Secret;
     use cashu::{Amount, CurrencyUnit, MintUrl, Proofs, Token};
-    use http::{Request as HttpRequest, StatusCode};
+    use http::{header::AUTHORIZATION, Request as HttpRequest, StatusCode};
     use tower::ServiceExt;
 
     use super::*;
@@ -319,18 +379,30 @@ mod tests {
             .expect("build request")
     }
 
-    /// Build a GET /gated request with the supplied X-Cashu header value.
-    fn request_with_header(value: &str) -> HttpRequest<Body> {
+    /// Build a GET /gated request with the supplied raw `Authorization`
+    /// header value.
+    fn request_with_authorization(value: &str) -> HttpRequest<Body> {
         HttpRequest::builder()
             .uri("/gated")
-            .header(X_CASHU, value)
+            .header(AUTHORIZATION, value)
             .body(Body::empty())
             .expect("build request with header")
     }
 
+    /// Wrap a raw `cashuB…` token in the MPP-Cashu envelope.
+    fn payment_header_with_token(token: &str) -> String {
+        format!(r#"Payment method="cashu", token="{token}""#)
+    }
+
+    /// Build a GET /gated request whose `Authorization` header is the
+    /// MPP envelope around `token`.
+    fn request_with_token(token: &str) -> HttpRequest<Body> {
+        request_with_authorization(&payment_header_with_token(token))
+    }
+
     /// Build a GET /gated request with raw header bytes (used for the
     /// non-utf8 test case).
-    fn request_with_raw_header(value: &[u8]) -> HttpRequest<Body> {
+    fn request_with_raw_authorization(value: &[u8]) -> HttpRequest<Body> {
         // `header()` rejects non-ASCII at builder time; reach down to
         // HeaderValue::from_bytes which accepts arbitrary bytes.
         let mut req = HttpRequest::builder()
@@ -338,26 +410,34 @@ mod tests {
             .body(Body::empty())
             .expect("build request");
         let hv = http::HeaderValue::from_bytes(value).expect("non-utf8 header bytes are valid");
-        req.headers_mut().insert(X_CASHU, hv);
+        req.headers_mut().insert(AUTHORIZATION, hv);
         req
     }
 
     // ---- Tests -------------------------------------------------------
 
     #[tokio::test]
-    async fn no_header_returns_402_with_x_cashu() {
+    async fn no_authorization_header_returns_402_with_www_authenticate() {
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app.oneshot(bare_request()).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let header = response
             .headers()
-            .get(X_CASHU)
-            .expect("X-Cashu header present on 402");
-        let header_str = header.to_str().expect("X-Cashu is ASCII");
+            .get(http::header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate header present on 402");
+        let header_str = header.to_str().expect("WWW-Authenticate is ASCII");
         assert!(
-            header_str.starts_with("creqA"),
-            "expected creqA prefix, got {}",
-            &header_str[..header_str.len().min(16)]
+            header_str.starts_with(r#"Payment method="cashu", challenge="creqA"#),
+            "expected MPP-Cashu envelope, got {header_str}"
+        );
+        assert!(
+            header_str.ends_with('"'),
+            "challenge value must be quoted-string-terminated, got {header_str}"
+        );
+        // Confirm no legacy X-Cashu header leaks onto the 402.
+        assert!(
+            response.headers().get("x-cashu").is_none(),
+            "X-Cashu must not be emitted in MPP-only mode"
         );
     }
 
@@ -373,7 +453,7 @@ mod tests {
 
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
-            .oneshot(request_with_header(&encoded))
+            .oneshot(request_with_token(&encoded))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
@@ -394,7 +474,7 @@ mod tests {
         // 0xFF is not valid UTF-8.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
-            .oneshot(request_with_raw_header(&[0xFFu8, 0xFE, 0xFD]))
+            .oneshot(request_with_raw_authorization(&[0xFFu8, 0xFE, 0xFD]))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -403,7 +483,7 @@ mod tests {
             .expect("collect body");
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
-            body.contains("invalid X-Cashu header encoding"),
+            body.contains("invalid Authorization header encoding"),
             "unexpected body: {body}"
         );
     }
@@ -413,7 +493,7 @@ mod tests {
         // Recognized prefix, garbage payload — Error::DecodeFailed path.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
-            .oneshot(request_with_header("cashuB!!!notbase64!!!"))
+            .oneshot(request_with_token("cashuB!!!notbase64!!!"))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -435,7 +515,7 @@ mod tests {
 
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
-            .oneshot(request_with_header(&encoded))
+            .oneshot(request_with_token(&encoded))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -458,7 +538,7 @@ mod tests {
 
         let app = router_with(state_with(SwapResponse::Unreachable));
         let response = app
-            .oneshot(request_with_header(&encoded))
+            .oneshot(request_with_token(&encoded))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -482,7 +562,7 @@ mod tests {
 
         let app = router_with(state_with(SwapResponse::RejectedSwap));
         let response = app
-            .oneshot(request_with_header(&encoded))
+            .oneshot(request_with_token(&encoded))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -493,6 +573,89 @@ mod tests {
         assert!(
             body.contains("mint rejected swap"),
             "expected mint-rejected-swap message, got: {body}"
+        );
+    }
+
+    // ---- MPP envelope parsing tests ----------------------------------
+
+    #[tokio::test]
+    async fn non_payment_scheme_returns_402() {
+        // `Authorization: Bearer …` is not an MPP-Cashu attempt at all.
+        // RFC 7235 §3.1 lets the server treat unsupported schemes as
+        // "credentials not presented" — same flow as a missing header.
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization("Bearer abcdef"))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let header = response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .expect("challenge re-issued on non-Payment scheme");
+        assert!(header
+            .to_str()
+            .unwrap()
+            .starts_with(r#"Payment method="cashu""#));
+    }
+
+    #[tokio::test]
+    async fn payment_with_wrong_method_returns_400() {
+        // `Payment` scheme is right but the method extension isn't
+        // ours — middleware must reject (400) instead of re-challenging.
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(
+                r#"Payment method="tempo", token="cashuBabc""#,
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert!(
+            body.contains("method must be 'cashu'"),
+            "expected wrong-method message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_with_missing_token_returns_400() {
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(r#"Payment method="cashu""#))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert!(
+            body.contains("missing 'token'"),
+            "expected missing-token message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_with_missing_method_returns_400() {
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(
+                r#"Payment token="cashuBabc""#,
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert!(
+            body.contains("missing 'method'"),
+            "expected missing-method message, got: {body}"
         );
     }
 }

@@ -6,7 +6,7 @@ end-to-end against a real (or test) PoP-issuing Cashu mint.
 One endpoint:
 
 - `GET /random-number` — returns `{ "number": <random u64> }` after a
-  NUT-24 PoP challenge has been satisfied.
+  PoP challenge has been satisfied.
 
 The demo is intentionally bare. It is a **smoke target**: spin it up
 against a running mint and prove the protocol works. No automated tests
@@ -52,11 +52,12 @@ You should see:
 
 ```text
 HTTP/1.1 402 Payment Required
-x-cashu: creqA...<base64url>
+www-authenticate: Payment method="cashu", challenge="creqA...<base64url>"
 content-length: 0
 ```
 
-The `x-cashu` header carries the NUT-18 `creqA…` payment request that
+The `WWW-Authenticate` header carries the MPP-Cashu envelope. The
+`challenge` parameter is the NUT-18 `creqA…` payment request that
 encodes everything a wallet needs to mint a PoP credential: mint URL,
 unit (e.g. `pop_1700000000`), and amount.
 
@@ -64,7 +65,8 @@ unit (e.g. `pop_1700000000`), and amount.
 
 ```sh
 curl -si http://localhost:3000/random-number \
-  | awk '/^x-cashu:/ {print $2}' \
+  | awk 'BEGIN{IGNORECASE=1} /^www-authenticate:/' \
+  | sed -E 's/.*challenge="([^"]+)".*/\1/' \
   | tr -d '\r\n'
 ```
 
@@ -75,11 +77,11 @@ demo — Commit 7 wires up an agent-side client.)
 ### 3. Retry with the proof
 
 Once the wallet hands back a `cashuB…` token, replay the request with
-it in the `X-Cashu` header:
+it inside an MPP-Cashu `Authorization` header:
 
 ```sh
 curl -i \
-  -H 'X-Cashu: cashuB...<your token>' \
+  -H 'Authorization: Payment method="cashu", token="cashuB...<your token>"' \
   http://localhost:3000/random-number
 ```
 
@@ -101,6 +103,11 @@ the hood.
   out-of-band. Demo log stays quiet.
 - **Bad token (`cashuB!!!notbase64!!!`)**: `400 Bad Request` with body
   `decode failed: …`.
+- **Wrong method (e.g. `Payment method="tempo", …`)**: `400 Bad
+  Request` with body `… method must be 'cashu', got "tempo"`.
+- **Wrong scheme (e.g. `Authorization: Bearer …`)**: middleware
+  responds `402` again with the MPP-Cashu challenge — the request is
+  treated as "no PoP attempt".
 - **Wrong unit (e.g. wallet minted `sat` instead of `pop_<ts>`)**: `400
   Bad Request` with body `token unit … does not match requirement
   unit …`.
@@ -114,7 +121,9 @@ status-code → error mapping (per NUT-24 §"Errors").
 
 ## Out of scope
 
-This commit ships the bearer arm only. There is **no** MPP-Cashu
-`WWW-Authenticate: Payment` emitted alongside the 402, and **no**
-separate `/pay` endpoint — clients retry the same URL with the proof
-in `X-Cashu`. The MPP-Cashu extension is being drafted separately.
+This commit ships the MPP-Cashu envelope only. There is **no** legacy
+`X-Cashu` header emitted or accepted, and **no** separate `/pay`
+endpoint — clients retry the same URL with the proof inside the
+`Authorization: Payment …` header. The MPP-Cashu method extension is
+not yet formalized in the MPP spec; the shape used here is the
+tentative pre-spec form.

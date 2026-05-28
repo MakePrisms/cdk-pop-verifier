@@ -4,19 +4,20 @@
 //! Exposes one endpoint:
 //!
 //! * `GET /random-number` — returns `{ "number": <random u64> }` after
-//!   the NUT-24 PoP challenge has been satisfied.
+//!   the MPP-Cashu PoP challenge has been satisfied.
 //!
 //! The endpoint is wrapped in [`cdk_pop_verifier::require_pop`], so the
 //! first request from a fresh client gets a `402 Payment Required` with
-//! the `X-Cashu: creqA…` challenge header. The client obtains a PoP
-//! credential from the configured mint (out of band — e.g. via a Cashu
-//! wallet), then retries the same URL with `X-Cashu: cashuB…`. On
-//! validation success the handler runs and returns a random number.
+//! a `WWW-Authenticate: Payment method="cashu", challenge="creqA…"`
+//! header. The client obtains a PoP credential from the configured
+//! mint (out of band — e.g. via a Cashu wallet), then retries the same
+//! URL with `Authorization: Payment method="cashu", token="cashuB…"`.
+//! On validation success the handler runs and returns a random number.
 //!
 //! This binary is intentionally tiny: it exists to prove the protocol
 //! works against a live mint, not to ship a product feature. There is
-//! no MPP-Cashu emission, no agent client integration, no automated
-//! tests — see `README.md` for the manual smoke-test recipe.
+//! no agent-side client integration and no automated tests — see
+//! `README.md` for the manual smoke-test recipe.
 
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;

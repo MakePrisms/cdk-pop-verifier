@@ -5,11 +5,13 @@
 
 #![warn(missing_docs)]
 
+pub mod cdk_mint_client;
 pub mod challenge;
 pub mod error;
 pub mod mint_client;
 pub mod validator;
 
+pub use cdk_mint_client::CdkMintClient;
 pub use challenge::{decode_token, encode_challenge, PopRequirement};
 pub use error::Error;
 pub use mint_client::{MintClient, MintClientError};

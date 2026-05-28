@@ -8,22 +8,26 @@
 //! secrets — PoP is transfer-on-use.
 //!
 //! This module exposes only the trait + error surface. A concrete
-//! `cdk`-backed implementation lands in Commit 4; tests in Commit 3 use a
-//! mock impl defined alongside the validator tests.
+//! `cdk`-backed implementation lives in [`crate::cdk_mint_client`]; tests
+//! in this crate use a mock impl defined alongside the validator tests.
 //!
 //! The trait deliberately takes a [`MintUrl`] and [`Proofs`] rather than the
 //! decoded [`Token`][cashu::Token] so concrete implementations can fetch
 //! mint keyset info up front and feed already-expanded proofs to the swap
 //! call. Translating a [`Token`][cashu::Token] into [`Proofs`] is the
-//! validator's responsibility.
+//! validator's responsibility — and is why [`MintClient::keysets`] exists
+//! as its own trait method: V1-format token keyset IDs are short (7 bytes)
+//! and need a full [`KeySetInfo`] list to resolve into a long [`Id`][cashu::nuts::Id]
+//! before [`Token::proofs`][cashu::Token::proofs] will return them.
 //!
 //! `MintClientError` is intentionally coarse: `Unreachable` for transport
 //! failures and `RejectedSwap` for any mint-side refusal. Refining
 //! `RejectedSwap` (e.g. distinguishing expired vs. double-spent vs.
-//! keyset-rotated) is deferred until the cdk-backed implementation lands
-//! and can surface specific NUT-03 error codes.
+//! keyset-rotated) is deferred until later commits can surface specific
+//! NUT-03 error codes.
 
 use async_trait::async_trait;
+use cashu::nuts::nut02::KeySetInfo;
 use cashu::{MintUrl, Proofs};
 use thiserror::Error;
 
@@ -33,6 +37,21 @@ use thiserror::Error;
 /// shared across async tasks (e.g. inside an HTTP handler chain).
 #[async_trait]
 pub trait MintClient: Send + Sync {
+    /// Fetch the mint's NUT-02 keyset list.
+    ///
+    /// The validator needs this to resolve V1-format short keyset IDs
+    /// (`KeySetVersion::Version01`) that appear in tokens on the wire.
+    /// Without a matching [`KeySetInfo`] the cashu crate cannot decode the
+    /// proofs — see [`cashu::Token::proofs`].
+    ///
+    /// Returning an empty `Vec` is valid (the mint reports no keysets);
+    /// callers must treat that as "no V1 IDs resolvable" rather than an
+    /// error.
+    async fn keysets(
+        &self,
+        mint_url: &MintUrl,
+    ) -> Result<Vec<KeySetInfo>, MintClientError>;
+
     /// Swap `proofs` at `mint_url` for new proofs held by the verifier.
     ///
     /// The semantics match NUT-03 swap: the mint atomically consumes the

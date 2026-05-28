@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 cashu = { workspace = true }
+cdk = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 

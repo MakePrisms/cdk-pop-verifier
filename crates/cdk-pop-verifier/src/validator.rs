@@ -156,12 +156,29 @@ impl<M: MintClient> PopValidator<M> {
             });
         }
 
-        // Extract proofs. `Token::proofs(&[])` works for V0 (legacy) short
-        // keyset IDs because they round-trip without keyset lookup; V1
-        // short IDs will surface as MalformedToken here. A future
-        // commit (Commit 4) wires keyset fetching in before this call.
+        // Network: fetch keysets for V1 short-id resolution.
+        //
+        // V0 keyset IDs round-trip locally; V1 short IDs are a 7-byte
+        // prefix on the wire and need a full 32-byte ID from the mint's
+        // `/v1/keysets` response to expand. We fetch up front so the
+        // proof-extraction step below works for both formats. If the
+        // mint is unreachable, surface that before the swap call — no
+        // point attempting swap when we can't even read the inputs.
+        let keysets = self
+            .mint_client
+            .keysets(&token_mint)
+            .await
+            .map_err(|e| match e {
+                MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
+                MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+            })?;
+
+        // Extract proofs against the fetched keyset list. Resolves V1
+        // short IDs cleanly; V0 short IDs do not consult the list. If a
+        // V1 ID has no matching keyset, this surfaces as MalformedToken
+        // (the cashu crate returns `UnknownShortKeysetId`).
         let proofs = token
-            .proofs(&[])
+            .proofs(&keysets)
             .map_err(|e| ValidationError::MalformedToken(e.to_string()))?;
 
         // Structural: non-empty.
@@ -218,7 +235,8 @@ mod tests {
 
     use async_trait::async_trait;
     use cashu::dhke::hash_to_curve;
-    use cashu::nuts::{Id, Proof};
+    use cashu::nuts::nut02::{Id, KeySetInfo};
+    use cashu::nuts::Proof;
     use cashu::secret::Secret;
     use cashu::{Amount, CurrencyUnit, MintUrl, Proofs, Token};
 
@@ -226,12 +244,8 @@ mod tests {
     use crate::challenge::PopRequirement;
     use crate::mint_client::{MintClient, MintClientError};
 
-    /// Mock [`MintClient`] used in validator unit tests.
-    ///
-    /// `response` is the canned outcome. `call_count` lets each test assert
-    /// whether the mint was actually contacted (structural failures must
-    /// short-circuit before swap).
-    enum MockResponse {
+    /// Canned outcome for the mock [`MintClient::swap`] call.
+    enum SwapResponse {
         /// Echo the incoming proofs back as the "new" proofs. Lets tests
         /// assert amount preservation without constructing fresh proofs.
         Echo,
@@ -241,38 +255,92 @@ mod tests {
         RejectedSwap,
     }
 
+    /// Canned outcome for the mock [`MintClient::keysets`] call.
+    enum KeysetsResponse {
+        /// Return the supplied list of [`KeySetInfo`]s.
+        Ok(Vec<KeySetInfo>),
+        /// Return [`MintClientError::Unreachable`] with a fixed message.
+        Unreachable,
+    }
+
+    /// Mock [`MintClient`] used in validator unit tests.
+    ///
+    /// `swap_response` and `keysets_response` are the canned outcomes for
+    /// each trait method. `swap_calls` and `keysets_calls` let tests
+    /// assert whether and how often each endpoint was actually contacted
+    /// (structural failures must short-circuit before any network call).
     struct MockMintClient {
-        response: MockResponse,
-        call_count: Arc<AtomicUsize>,
+        swap_response: SwapResponse,
+        keysets_response: KeysetsResponse,
+        swap_calls: Arc<AtomicUsize>,
+        keysets_calls: Arc<AtomicUsize>,
+    }
+
+    /// Call counters returned by [`MockMintClient::new`] so tests can
+    /// observe behaviour without holding a reference to the mock itself.
+    #[derive(Clone)]
+    struct MockCounters {
+        swap: Arc<AtomicUsize>,
+        keysets: Arc<AtomicUsize>,
     }
 
     impl MockMintClient {
-        fn new(response: MockResponse) -> (Self, Arc<AtomicUsize>) {
-            let call_count = Arc::new(AtomicUsize::new(0));
+        fn new(
+            swap_response: SwapResponse,
+            keysets_response: KeysetsResponse,
+        ) -> (Self, MockCounters) {
+            let swap_calls = Arc::new(AtomicUsize::new(0));
+            let keysets_calls = Arc::new(AtomicUsize::new(0));
+            let counters = MockCounters {
+                swap: swap_calls.clone(),
+                keysets: keysets_calls.clone(),
+            };
             (
                 Self {
-                    response,
-                    call_count: call_count.clone(),
+                    swap_response,
+                    keysets_response,
+                    swap_calls,
+                    keysets_calls,
                 },
-                call_count,
+                counters,
             )
+        }
+
+        /// Convenience: build a mock that returns the default empty
+        /// keyset list (sufficient for V0-format tokens) and the supplied
+        /// swap response.
+        fn with_swap(swap_response: SwapResponse) -> (Self, MockCounters) {
+            Self::new(swap_response, KeysetsResponse::Ok(Vec::new()))
         }
     }
 
     #[async_trait]
     impl MintClient for MockMintClient {
+        async fn keysets(
+            &self,
+            _mint_url: &MintUrl,
+        ) -> Result<Vec<KeySetInfo>, MintClientError> {
+            self.keysets_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.keysets_response {
+                KeysetsResponse::Ok(infos) => Ok(infos.clone()),
+                KeysetsResponse::Unreachable => {
+                    Err(MintClientError::Unreachable("mock keysets unreachable".into()))
+                }
+            }
+        }
+
         async fn swap(
             &self,
             _mint_url: &MintUrl,
             proofs: Proofs,
         ) -> Result<Proofs, MintClientError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            match self.response {
-                MockResponse::Echo => Ok(proofs),
-                MockResponse::Unreachable => {
+            self.swap_calls.fetch_add(1, Ordering::SeqCst);
+            match self.swap_response {
+                SwapResponse::Echo => Ok(proofs),
+                SwapResponse::Unreachable => {
                     Err(MintClientError::Unreachable("mock unreachable".into()))
                 }
-                MockResponse::RejectedSwap => {
+                SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
             }
@@ -298,11 +366,42 @@ mod tests {
         // V0 keyset id (`00` prefix); `Token::proofs(&[])` round-trips V0
         // short ids without needing KeySetInfo.
         let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        proof_with_keyset(amount, index, keyset_id)
+    }
+
+    /// As [`make_proof`] but parameterised by keyset id so tests can mint
+    /// V1-format proofs (`01` prefix, 32 bytes of id).
+    fn proof_with_keyset(amount: u64, index: u8, keyset_id: Id) -> Proof {
         let mut preimage = [0u8; 33];
         preimage[0] = 1;
         preimage[1] = index;
         let c = hash_to_curve(&preimage).expect("hash_to_curve");
         Proof::new(Amount::from(amount), keyset_id, Secret::generate(), c)
+    }
+
+    /// Build a representative V1 keyset id (`01` prefix + 32 bytes).
+    /// The bytes are arbitrary — V1 short-id resolution only checks
+    /// that the 7-byte token prefix matches the first 7 bytes of the
+    /// full id, so any well-formed 32-byte id round-trips through the
+    /// token codec.
+    fn v1_keyset_id() -> Id {
+        Id::from_str(
+            "01aabbccddeeff001122334455667788\
+              99aabbccddeeff00112233445566778899",
+        )
+        .expect("valid v1 keyset id")
+    }
+
+    /// Build a [`KeySetInfo`] for a V1 id that matches the proofs
+    /// produced via [`proof_with_keyset`] with that same id.
+    fn keyset_info(id: Id, unit: CurrencyUnit) -> KeySetInfo {
+        KeySetInfo {
+            id,
+            unit,
+            active: true,
+            input_fee_ppk: 0,
+            final_expiry: None,
+        }
     }
 
     fn make_token(mint: MintUrl, unit: CurrencyUnit, proofs: Proofs) -> Token {
@@ -326,7 +425,7 @@ mod tests {
         let token = make_token(mint_a(), pop_unit(), proofs);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::Echo);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
         let validator = PopValidator::new(mock);
 
         let ValidatedPop {
@@ -339,7 +438,16 @@ mod tests {
             .await
             .expect("happy-path validation succeeds");
 
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "mint must be called");
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            1,
+            "keysets endpoint must be called once"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            1,
+            "swap endpoint must be called once"
+        );
         assert_eq!(mint_url, mint_a());
         assert_eq!(unit, pop_unit());
         assert_eq!(amount, Amount::from(10));
@@ -351,7 +459,7 @@ mod tests {
         let token = make_token(mint_a(), CurrencyUnit::Sat, vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::Echo);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
         let validator = PopValidator::new(mock);
 
         let err = validator
@@ -363,9 +471,14 @@ mod tests {
             "expected UnitMismatch, got {err:?}"
         );
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
+            counters.swap.load(Ordering::SeqCst),
             0,
-            "mint must NOT be called on unit mismatch"
+            "swap must NOT be called on unit mismatch"
+        );
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            0,
+            "keysets must NOT be called on unit mismatch"
         );
     }
 
@@ -375,7 +488,7 @@ mod tests {
         let token = make_token(mint_b(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::Echo);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
         let validator = PopValidator::new(mock);
 
         let err = validator
@@ -387,9 +500,14 @@ mod tests {
             "expected MintNotAllowed, got {err:?}"
         );
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
+            counters.swap.load(Ordering::SeqCst),
             0,
-            "mint must NOT be called on mint-allowlist failure"
+            "swap must NOT be called on mint-allowlist failure"
+        );
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            0,
+            "keysets must NOT be called on mint-allowlist failure"
         );
     }
 
@@ -399,7 +517,7 @@ mod tests {
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(2, 0), make_proof(3, 1)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::Echo);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
         let validator = PopValidator::new(mock);
 
         let err = validator
@@ -411,9 +529,9 @@ mod tests {
             "expected AmountInsufficient, got {err:?}"
         );
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
+            counters.swap.load(Ordering::SeqCst),
             0,
-            "mint must NOT be called on insufficient amount"
+            "swap must NOT be called on insufficient amount"
         );
     }
 
@@ -422,7 +540,7 @@ mod tests {
         let token = make_token(mint_a(), pop_unit(), vec![]);
         let req = requirement(pop_unit(), vec![mint_a()], 1);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::Echo);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
         let validator = PopValidator::new(mock);
 
         let err = validator
@@ -434,9 +552,9 @@ mod tests {
             "expected TokenEmpty, got {err:?}"
         );
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
+            counters.swap.load(Ordering::SeqCst),
             0,
-            "mint must NOT be called on empty token"
+            "swap must NOT be called on empty token"
         );
     }
 
@@ -445,7 +563,7 @@ mod tests {
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::Unreachable);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Unreachable);
         let validator = PopValidator::new(mock);
 
         let err = validator
@@ -457,9 +575,9 @@ mod tests {
             "expected MintUnreachable, got {err:?}"
         );
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
+            counters.swap.load(Ordering::SeqCst),
             1,
-            "mint must be called once before unreachable surfaces"
+            "swap must be called once before unreachable surfaces"
         );
     }
 
@@ -470,7 +588,7 @@ mod tests {
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
-        let (mock, call_count) = MockMintClient::new(MockResponse::RejectedSwap);
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::RejectedSwap);
         let validator = PopValidator::new(mock);
 
         let err = validator
@@ -482,9 +600,108 @@ mod tests {
             "expected MintRejectedSwap, got {err:?}"
         );
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
+            counters.swap.load(Ordering::SeqCst),
             1,
-            "mint must be called once before rejection surfaces"
+            "swap must be called once before rejection surfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_happy_path_v1_keyset() {
+        // Synthesize a V1-format token: proofs whose keyset id has the
+        // `01` version byte. On the wire the token serializes the id as
+        // a 7-byte short id; decoding back into proofs needs the matching
+        // full 32-byte `KeySetInfo` from the mint's keysets endpoint.
+        let v1_id = v1_keyset_id();
+        let proofs = vec![
+            proof_with_keyset(7, 0, v1_id),
+            proof_with_keyset(3, 1, v1_id),
+        ];
+        // Round-trip the token through encode/decode so the proofs lose
+        // their full id and force the validator to resolve via keysets().
+        let token_str = make_token(mint_a(), pop_unit(), proofs).to_string();
+        let token = Token::from_str(&token_str).expect("v1 token round-trips");
+
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::new(
+            SwapResponse::Echo,
+            KeysetsResponse::Ok(vec![keyset_info(v1_id, pop_unit())]),
+        );
+        let validator = PopValidator::new(mock);
+
+        let ValidatedPop { amount, .. } = validator
+            .validate(&token, &req)
+            .await
+            .expect("v1 happy path validates");
+        assert_eq!(amount, Amount::from(10));
+        assert_eq!(counters.keysets.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.swap.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn validate_propagates_keysets_unreachable() {
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) =
+            MockMintClient::new(SwapResponse::Echo, KeysetsResponse::Unreachable);
+        let validator = PopValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("keysets-unreachable must fail");
+        assert!(
+            matches!(err, ValidationError::MintUnreachable(_)),
+            "expected MintUnreachable, got {err:?}"
+        );
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            1,
+            "keysets must be called once before unreachable surfaces"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "swap must NOT be called when keysets() failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_v1_token_with_no_matching_keyset() {
+        // V1 token but the mint returns an empty keysets list — the
+        // 7-byte short id cannot be resolved into a full id, so proof
+        // extraction surfaces as MalformedToken. Swap must not be
+        // attempted: we cannot construct a swap request without proofs.
+        let v1_id = v1_keyset_id();
+        let proofs = vec![proof_with_keyset(10, 0, v1_id)];
+        let token_str = make_token(mint_a(), pop_unit(), proofs).to_string();
+        let token = Token::from_str(&token_str).expect("v1 token round-trips");
+
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) =
+            MockMintClient::new(SwapResponse::Echo, KeysetsResponse::Ok(Vec::new()));
+        let validator = PopValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("no-matching-keyset must fail");
+        assert!(
+            matches!(err, ValidationError::MalformedToken(_)),
+            "expected MalformedToken, got {err:?}"
+        );
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            1,
+            "keysets must be called"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "swap must NOT be called when no proofs can be extracted"
         );
     }
 }

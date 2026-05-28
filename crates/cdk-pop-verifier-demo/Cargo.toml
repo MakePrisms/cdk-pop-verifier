@@ -1,0 +1,46 @@
+[package]
+name = "cdk-pop-verifier-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Standalone binary that exercises `cdk-pop-verifier` end-to-end against
+# a real (or test) PoP-issuing mint. Not a library — the crate exposes
+# no public API surface; everything lives under `src/main.rs`.
+[[bin]]
+name = "cdk-pop-verifier-demo"
+path = "src/main.rs"
+
+[dependencies]
+# The verifier crate under test. Path dep so local edits to it surface
+# without a publish cycle.
+cdk-pop-verifier = { path = "../cdk-pop-verifier" }
+
+# `axum` + `tokio` host the HTTP endpoint. Same major as the verifier
+# (0.7) so the middleware type signatures line up.
+axum = { workspace = true }
+tokio = { workspace = true }
+
+# CLI surface.
+clap = { workspace = true }
+
+# `cashu` types for parsing CLI args (`--mint-url`, `--unit`, `--amount`)
+# into the strongly-typed values `PopRequirement` wants. Same pin as the
+# verifier so the `Amount` / `CurrencyUnit` / `MintUrl` types are the
+# very same types — no conversion layer needed.
+cashu = { workspace = true }
+
+# Handler emits `{"number": <random u64>}`. `axum::Json` re-exports
+# serde_json under the hood but we use it directly for clarity.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Random number source for the demo handler. PoP makes no claim about
+# RNG quality; this is a smoke target, not a CSPRNG service.
+rand = { workspace = true }
+
+# Logging: "listening on …" and per-request span context if RUST_LOG
+# enables it.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

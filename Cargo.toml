@@ -20,13 +20,27 @@ cashu = "0.16.0"
 # cdk supplies `wallet::MintConnector` (the HTTP client surface for keysets,
 # swap, etc.). We only need the wallet half — no mint, no signatory.
 cdk = { version = "0.16.0", default-features = false, features = ["wallet"] }
+# `clap` parses CLI args for the `cdk-pop-verifier-demo` binary. Derive
+# feature only — the demo's `Args` struct uses `#[derive(Parser)]`.
+clap = { version = "4", features = ["derive"] }
 # `http` is re-exported by axum but we use its types directly for header
 # construction in the middleware (StatusCode, HeaderName, HeaderValue).
 http = "1"
+# `rand` produces the demo handler's random u64. Pin to 0.8: bitcoin
+# / secp256k1 (transitive via cashu) already pull 0.8, so this avoids
+# adding a second `rand` major to the dep graph.
+rand = "0.8"
 thiserror = "2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt"] }
+# `rt-multi-thread` is needed by the demo's `#[tokio::main]`; `net` for
+# its `TcpListener`. `macros` + `rt` already covered the verifier crate's
+# `#[tokio::test]` cases.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net"] }
 # `tower` provides `ServiceExt::oneshot` used by the middleware unit tests
 # to drive the router without a TCP listener.
 tower = "0.5"
+# `tracing` + `tracing-subscriber` give the demo a structured "listening
+# on …" log line and pick up `RUST_LOG=…` via the env-filter feature.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

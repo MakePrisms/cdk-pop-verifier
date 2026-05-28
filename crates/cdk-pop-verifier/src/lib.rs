@@ -1,7 +1,7 @@
 //! PoP (Proof of Power) verifier SDK.
 //!
-//! `draft-httpauth-payment-00` HTTP-402 verifier for `pop_<ts>` Cashu
-//! credentials. The verifier challenges holders with
+//! Per `draft-httpauth-payment-00`, an HTTP-402 verifier for `pop_<ts>`
+//! Cashu credentials. The verifier challenges holders with
 //! `WWW-Authenticate: Payment id="…", realm="…", method="cashu",
 //! intent="charge", request="<base64url(json{cashu_request:creqA…})>"`
 //! and accepts proofs on
@@ -33,6 +33,6 @@ pub use middleware::{require_pop, PopMiddlewareState, DEFAULT_REALM, INTENT_CHAR
 pub use mint_client::{MintClient, MintClientError};
 pub use validator::{PopValidator, ValidatedPop, ValidationError};
 
-/// Placeholder for the PoP verifier. Real surface lands in Commit 2+.
+/// Placeholder type retained for backwards compatibility.
 #[derive(Debug)]
 pub struct PopVerifier;

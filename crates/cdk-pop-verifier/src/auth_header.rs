@@ -25,10 +25,9 @@
 //! can reject non-cashu methods) and the `payload.cashu_token` (the
 //! `cashuB…` string the validator decodes via [`crate::decode_token`]).
 //!
-//! Per gudnuf's MUST-only directive, every field that the draft marks
-//! `Required` is honoured here; `RECOMMENDED`/`OPTIONAL` fields
-//! (`source`, `description`, `opaque`, `digest`, `expires`) are
-//! tolerated on the wire but otherwise ignored.
+//! Every field marked `Required` by the draft is honoured here;
+//! `RECOMMENDED`/`OPTIONAL` fields (`source`, `description`, `opaque`,
+//! `digest`, `expires`) are tolerated on the wire but otherwise ignored.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -40,17 +39,17 @@ use thiserror::Error;
 pub const PAYMENT_SCHEME: &str = "Payment";
 
 /// Required value for the `method` field on the echoed challenge for
-/// the cashu method extension. Case-sensitive on the wire (lowercase
-/// per draft §5.1.1: "MUST be a lowercase ASCII string").
+/// the cashu method extension. Per draft §5.1.1 the wire value MUST be
+/// a lowercase ASCII string, so this comparison is case-sensitive.
 pub const CASHU_METHOD: &str = "cashu";
 
 /// Echo of the WWW-Authenticate auth-params per draft §5.2 Table 4.
 ///
 /// The Payment Authentication draft requires the client to round-trip
 /// every required parameter from the 402's `WWW-Authenticate: Payment`
-/// header. We deserialize all required fields; optional fields
+/// header. All required fields are deserialized; optional fields
 /// (`description`, `opaque`, `digest`, `expires`) are accepted but not
-/// surfaced — they're not load-bearing for our verifier.
+/// surfaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchoedChallenge {
     /// Echo of the server-issued challenge id.
@@ -70,7 +69,7 @@ pub struct EchoedChallenge {
 ///
 /// For cashu this is the `cashuB…` token the holder mints from the PoP
 /// issuer. The token's structural validation (prefix, base64, CBOR,
-/// proof shape) is the validator's job — this struct just carries the
+/// proof shape) is the validator's job; this struct just carries the
 /// string out of the JSON envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashuPayload {
@@ -82,9 +81,8 @@ pub struct CashuPayload {
 /// Full credentials object per draft §5.2.
 ///
 /// `challenge` and `payload` are `Required`; `source` is `RECOMMENDED`
-/// (DID) and skipped here (gudnuf MUST-only). Deserializing tolerates
-/// the presence of unknown fields so we round-trip a `source` field
-/// from clients that send it.
+/// (DID) and ignored here. Deserializing tolerates unknown fields so a
+/// `source` field from clients that send it round-trips silently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentCredentials {
     /// Echo of the WWW-Authenticate auth-params.
@@ -95,11 +93,11 @@ pub struct PaymentCredentials {
 
 /// Why an `Authorization: Payment <blob>` header failed to parse.
 ///
-/// Per draft §4.2, the server MUST reply `402` with a fresh
-/// `WWW-Authenticate: Payment` re-challenge on any validation failure.
-/// So unlike the previous RFC-7235-param flow, every variant here maps
-/// to a 402 in the middleware — they're surfaced as distinct enums
-/// only to make the response body intelligible to the client.
+/// Per draft §4.2 the server MUST reply `402` with a fresh
+/// `WWW-Authenticate: Payment` re-challenge on any validation failure,
+/// so every variant here maps to a 402 in the middleware — they are
+/// distinct enums only to make the response body intelligible to the
+/// client.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthParseError {
     /// First whitespace-separated token is not `Payment`.
@@ -159,9 +157,9 @@ pub fn parse_payment_authorization(
         return Err(AuthParseError::MissingCredentials);
     }
 
-    // The credentials blob is base64url without padding per draft §5.2.
-    // Reject anything else (including the legacy key=value RFC 7235
-    // param form) — it will trip up the base64 decoder.
+    // Per draft §5.2 the credentials blob is base64url without padding.
+    // Anything else (including the legacy key=value RFC 7235 param
+    // form) trips up the base64 decoder and is rejected.
     let bytes = URL_SAFE_NO_PAD
         .decode(rest)
         .map_err(|e| AuthParseError::Base64Decode(e.to_string()))?;

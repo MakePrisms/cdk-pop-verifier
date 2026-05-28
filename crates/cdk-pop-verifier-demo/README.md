@@ -40,7 +40,31 @@ Options:
   -h, --help                 Print help
 ```
 
+## TLS deployment (MUST in production)
+
+`draft-httpauth-payment-00` §11 requires TLS for any deployment that
+processes real value:
+
+> "Implementations MUST use TLS 1.2 or later for all communications
+> carrying Payment Authentication credentials."
+
+The demo binary listens on plain HTTP for local-loopback convenience
+only — that is fine for a smoke target running on `127.0.0.1`. **Any
+internet-facing deployment of this code (or downstream code reusing
+`cdk-pop-verifier`) MUST sit behind a TLS-terminating reverse proxy
+(nginx, caddy, traefik, AWS ALB, etc.) or be modified to terminate
+TLS directly via `axum-server` / `hyper-rustls`.** Without TLS, the
+`Authorization: Payment …` credentials blob — which carries the
+holder's `cashuB…` token — is exposed to any on-path observer, who
+could then race the legitimate client to the mint's swap endpoint and
+steal the value before the verifier completes its own swap.
+
 ## Manual smoke test
+
+The wire shape is `draft-httpauth-payment-00`. The 402 carries five
+required auth-params on `WWW-Authenticate: Payment`; the retry carries
+a single base64url-nopad-encoded JSON credentials blob on
+`Authorization: Payment`.
 
 ### 1. Hit the endpoint with no credential
 
@@ -52,36 +76,66 @@ You should see:
 
 ```text
 HTTP/1.1 402 Payment Required
-www-authenticate: Payment method="cashu", challenge="creqA...<base64url>"
+www-authenticate: Payment id="<uuid>", realm="cdk-pop-verifier", method="cashu", intent="charge", request="<base64url-nopad>"
+cache-control: no-store
 content-length: 0
 ```
 
-The `WWW-Authenticate` header carries the MPP-Cashu envelope. The
-`challenge` parameter is the NUT-18 `creqA…` payment request that
-encodes everything a wallet needs to mint a PoP credential: mint URL,
-unit (e.g. `pop_1700000000`), and amount.
+Per draft §11.10 every 402 carries `Cache-Control: no-store`. The
+`request` auth-param is a base64url-nopad-encoded JSON object
+`{ "cashu_request": "creqA…" }` — the inner `creqA…` is the
+standard NUT-18 payment-request the wallet uses to mint a PoP
+credential.
 
-### 2. Extract the challenge
+### 2. Extract the inner `creqA…` from the `request` envelope
 
 ```sh
-curl -si http://localhost:3000/random-number \
-  | awk 'BEGIN{IGNORECASE=1} /^www-authenticate:/' \
-  | sed -E 's/.*challenge="([^"]+)".*/\1/' \
-  | tr -d '\r\n'
+# 1. Pull the WWW-Authenticate value.
+WWW=$(curl -si http://localhost:3000/random-number | awk 'BEGIN{IGNORECASE=1} /^www-authenticate:/' | tr -d '\r')
+
+# 2. Pluck the request auth-param.
+REQ_BLOB=$(echo "$WWW" | sed -E 's/.*request="([^"]+)".*/\1/')
+
+# 3. Base64url-nopad-decode, parse JSON, extract cashu_request.
+CREQ=$(printf '%s' "$REQ_BLOB" | base64 -d --ignore-garbage 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)["cashu_request"])')
+echo "$CREQ"
 ```
 
+(GNU `base64` doesn't natively handle the URL-safe alphabet without
+padding; on systems where it does, prefer the native flag. The Python
+JSON unwrap is the only readable way to extract the inner field from
+the shell.)
+
 Hand that `creqA…` string to a NUT-18-aware Cashu wallet to mint the
-required PoP credential. (Wallet integration is out of scope for this
-demo — Commit 7 wires up an agent-side client.)
+required PoP credential.
 
-### 3. Retry with the proof
+### 3. Wrap the `cashuB…` token in the credentials envelope and retry
 
-Once the wallet hands back a `cashuB…` token, replay the request with
-it inside an MPP-Cashu `Authorization` header:
+Once the wallet returns a `cashuB…` token, build the credentials
+JSON, base64url-nopad-encode it, and replay the request with it
+inside an `Authorization: Payment` header. The `challenge` field
+echoes every auth-param the server sent on the 402:
 
 ```sh
+# Assume $ID, $REALM, $METHOD, $INTENT, $REQ_BLOB pulled from the WWW-Authenticate above,
+# and $CASHU_TOKEN is the cashuB... string from the wallet.
+BLOB=$(python3 -c "
+import base64, json
+creds = {
+  'challenge': {
+    'id':      '$ID',
+    'realm':   '$REALM',
+    'method':  '$METHOD',
+    'intent':  '$INTENT',
+    'request': '$REQ_BLOB'
+  },
+  'payload': {'cashu_token': '$CASHU_TOKEN'}
+}
+print(base64.urlsafe_b64encode(json.dumps(creds).encode()).rstrip(b'=').decode())
+")
+
 curl -i \
-  -H 'Authorization: Payment method="cashu", token="cashuB...<your token>"' \
+  -H "Authorization: Payment $BLOB" \
   http://localhost:3000/random-number
 ```
 
@@ -99,31 +153,50 @@ the hood.
 
 ### Error cases worth poking at
 
-- **No header, expired mint**: 402 returned but wallet melt/mint fails
-  out-of-band. Demo log stays quiet.
-- **Bad token (`cashuB!!!notbase64!!!`)**: `400 Bad Request` with body
-  `decode failed: …`.
-- **Wrong method (e.g. `Payment method="tempo", …`)**: `400 Bad
-  Request` with body `… method must be 'cashu', got "tempo"`.
-- **Wrong scheme (e.g. `Authorization: Bearer …`)**: middleware
-  responds `402` again with the MPP-Cashu challenge — the request is
-  treated as "no PoP attempt".
-- **Wrong unit (e.g. wallet minted `sat` instead of `pop_<ts>`)**: `400
-  Bad Request` with body `token unit … does not match requirement
-  unit …`.
+Per `draft-httpauth-payment-00` §4.2 every validation failure (bad
+header, bad token, wrong unit, wrong mint, insufficient amount,
+malformed proof, mint-rejected swap) returns `402 Payment Required`
+with a *fresh* `WWW-Authenticate: Payment` re-challenge and
+`Cache-Control: no-store`. The response body is a plain-text
+description of why the previous attempt failed.
+
+- **Bad token (`cashuB!!!notbase64!!!` inside the credentials)**:
+  `402` with body `decode failed: …`.
+- **Wrong method (`challenge.method = "tempo"`)**: `402` with body
+  `… method must be 'cashu', got "tempo"`.
+- **Wrong scheme (`Authorization: Bearer …`)**: middleware responds
+  `402` again with the cashu challenge — the request is treated as
+  "no PoP attempt" and the body is empty.
+- **Legacy param form (`Payment method="cashu", token="…"`)**: the
+  parser now requires a base64url-nopad blob; the old form trips the
+  base64 decoder → `402` re-challenge.
+- **Wrong unit (e.g. wallet minted `sat` instead of `pop_<ts>`)**:
+  `402` with body `token unit … does not match requirement unit …`.
 - **Mint unreachable mid-validation**: `503 Service Unavailable` with
-  body `mint unreachable: …`. Client may safely retry the same token.
-- **Wrong mint URL (token from another mint)**: `400 Bad Request` with
-  body `token mint … is not in the requirement's allowed mints: …`.
+  body `mint unreachable: …`. Client may safely retry the same token —
+  this is the only non-402 failure mode, because the draft does not
+  constrain backend transport failures.
+- **Wrong mint URL (token from another mint)**: `402` with body
+  `token mint … is not in the requirement's allowed mints: …`.
 
 See `crates/cdk-pop-verifier/src/middleware.rs` for the full
-status-code → error mapping (per NUT-24 §"Errors").
+status-code → error mapping.
 
 ## Out of scope
 
-This commit ships the MPP-Cashu envelope only. There is **no** legacy
-`X-Cashu` header emitted or accepted, and **no** separate `/pay`
-endpoint — clients retry the same URL with the proof inside the
-`Authorization: Payment …` header. The MPP-Cashu method extension is
-not yet formalized in the MPP spec; the shape used here is the
-tentative pre-spec form.
+This commit ships only the MUST-level subset of
+`draft-httpauth-payment-00`. The following draft features are
+SHOULD/MAY/OPTIONAL and intentionally not implemented:
+
+- `Payment-Receipt` response header on 200 (SHOULD)
+- RFC 9457 Problem Details JSON response bodies (SHOULD)
+- `digest` / `expires` / `description` / `opaque` auth-params on
+  `WWW-Authenticate` (OPTIONAL)
+- `source` (DID) field on the credentials JSON (RECOMMENDED)
+- Multi-method advertisement (MAY)
+- `Idempotency-Key` request header / `Accept-Payment` request header
+  (SHOULD / MAY)
+- Stateless challenge-id binding via HMAC per draft §5.1.2.1.1 — the
+  `id` is currently a fresh UUIDv4 (SHOULD)
+- IANA registration of `cashu` as a `method` value or `charge` as an
+  `intent` value (deferred)

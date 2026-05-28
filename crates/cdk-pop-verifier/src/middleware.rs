@@ -1,43 +1,44 @@
-//! Axum middleware that gates a route behind an MPP-Cashu PoP challenge.
+//! Axum middleware that gates a route behind a `draft-httpauth-payment-00`
+//! Payment Authentication challenge for the cashu method.
 //!
 //! Drop into an `axum::Router` with [`axum::middleware::from_fn_with_state`]
 //! to enforce the v1 happy path:
 //!
-//! 1. Request arrives without an `Authorization: Payment method="cashu"`
+//! 1. Request arrives without an `Authorization: Payment <blob>`
 //!    header — middleware responds `402 Payment Required` and places
-//!    `WWW-Authenticate: Payment method="cashu", challenge="creqA…"` on
-//!    the response. The `challenge` value is the standard NUT-18
-//!    [`PopRequirement`][crate::PopRequirement] in its canonical
-//!    `creqA…` encoding.
+//!    `WWW-Authenticate: Payment id="…", realm="…", method="cashu",
+//!    intent="charge", request="<base64url-nopad>"` on the response
+//!    along with `Cache-Control: no-store`. The `request` value wraps
+//!    the standard NUT-18 [`PopRequirement`][crate::PopRequirement] in
+//!    its canonical `creqA…` encoding via
+//!    [`encode_request_envelope`].
 //! 2. Client retries the same URL and method with `Authorization:
-//!    Payment method="cashu", token="cashuB…"` — middleware decodes the
-//!    token, runs the full [`PopValidator`] pipeline, and on success
-//!    attaches a [`ValidatedPop`] to `request.extensions_mut()` so the
-//!    downstream handler can read it via `Extension<ValidatedPop>`. On
-//!    failure the middleware writes a structured HTTP error per the
-//!    NUT-24 "Errors" section.
+//!    Payment <base64url-nopad-JSON>` where the JSON has the shape
+//!    described in [`crate::auth_header::PaymentCredentials`]. The
+//!    middleware extracts the `cashuB…` token from
+//!    `payload.cashu_token`, runs the full [`PopValidator`] pipeline,
+//!    and on success attaches a [`ValidatedPop`] to
+//!    `request.extensions_mut()` so the downstream handler can read it
+//!    via `Extension<ValidatedPop>`.
 //!
-//! ## MPP-Cashu envelope
+//! ## Failure mapping
 //!
-//! The envelope follows RFC 7235's `auth-scheme + auth-param*` shape:
+//! Per draft §4.2 the server MUST return `402 Payment Required` with a
+//! fresh `WWW-Authenticate: Payment` re-challenge on *any* validation
+//! failure — bad header, bad token, wrong unit, wrong mint, insufficient
+//! amount, malformed proof, or a mint that refused the swap. Only
+//! transport-level failures to reach the mint (DNS/TCP/TLS/timeout)
+//! surface as `503 Service Unavailable`, because the draft does not
+//! constrain backend failure modes.
 //!
-//! ```text
-//! HTTP/1.1 402 Payment Required
-//! WWW-Authenticate: Payment method="cashu", challenge="creqA…"
+//! Every 402 carries `Cache-Control: no-store` per draft §11.10.
 //!
-//! GET /resource
-//! Authorization: Payment method="cashu", token="cashuB…"
-//! ```
+//! ## Response body
 //!
-//! The MPP-Cashu *method extension* itself is not yet formalized in the
-//! MPP spec at <https://mpp.dev>; the shape here is gudnuf's tentative
-//! pre-spec form. The `creqA…` and `cashuB…` payloads are unchanged
-//! from the standalone NUT-24 path — only the framing changed.
-//!
-//! Per the v1 lock-ins this middleware is MPP-only: no `X-Cashu` header
-//! is read or emitted, and there is no separate `/pay` endpoint. The
-//! same URL + method that produced the 402 is what the client retries
-//! with the proof.
+//! 402 bodies are plain-text descriptions of why the previous attempt
+//! failed (e.g. `unit mismatch: expected pop_…, got sat`). RFC 9457
+//! Problem Details bodies are a SHOULD in the draft and intentionally
+//! skipped here per the MUST-only directive.
 
 use std::sync::Arc;
 
@@ -47,15 +48,28 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{header::HeaderValue, StatusCode};
+use uuid::Uuid;
 
 use crate::auth_header::{
-    parse_payment_authorization, AuthParseError, CASHU_METHOD, CHALLENGE_PARAM, METHOD_PARAM,
-    PAYMENT_SCHEME,
+    parse_payment_authorization, AuthParseError, EchoedChallenge, PAYMENT_SCHEME,
 };
-use crate::challenge::{decode_token, encode_challenge, PopRequirement};
+use crate::challenge::{
+    decode_token, encode_challenge, encode_request_envelope, PopRequirement,
+};
 use crate::error::Error as ChallengeError;
 use crate::mint_client::MintClient;
 use crate::validator::{PopValidator, ValidationError};
+
+/// Default `realm` value emitted in `WWW-Authenticate: Payment`. The
+/// draft mandates a `realm` auth-param but leaves the value
+/// operator-defined. We hardcode a sensible identifier for v1;
+/// operator-configurable wiring lands later (see TODO at use site).
+pub const DEFAULT_REALM: &str = "cdk-pop-verifier";
+
+/// `intent` value the verifier emits per draft §7. `charge` means "the
+/// server consumes the payment as a one-shot charge" — matches PoP's
+/// transfer-on-use semantics.
+pub const INTENT_CHARGE: &str = "charge";
 
 /// State the middleware needs at request time: the [`PopRequirement`]
 /// to advertise on 402 and the [`PopValidator`] that validates proofs
@@ -67,9 +81,9 @@ use crate::validator::{PopValidator, ValidationError};
 /// also behind an `Arc` so HTTP+TLS connection state is reused.
 #[derive(Debug)]
 pub struct PopMiddlewareState<M: MintClient> {
-    /// What the verifier requires from the holder. Emitted as the
-    /// `challenge="creqA…"` parameter of `WWW-Authenticate: Payment`
-    /// on the 402.
+    /// What the verifier requires from the holder. Wrapped into the
+    /// `request="…"` auth-param of `WWW-Authenticate: Payment` on the
+    /// 402.
     pub requirement: PopRequirement,
     /// Validator the middleware delegates to once the client retries
     /// with an `Authorization: Payment` proof header.
@@ -87,8 +101,8 @@ impl<M: MintClient> PopMiddlewareState<M> {
     }
 }
 
-/// Axum middleware entry point: enforces the MPP-Cashu PoP envelope on
-/// the request.
+/// Axum middleware entry point: enforces the Payment Authentication
+/// envelope on the request.
 ///
 /// Register with `axum::middleware::from_fn_with_state(state, require_pop)`
 /// where `state` is `Arc<PopMiddlewareState<M>>`. The `'static` bound on
@@ -103,54 +117,57 @@ pub async fn require_pop<M>(
 where
     M: MintClient + 'static,
 {
-    // Step 1: client must present an `Authorization: Payment …` header.
-    // Missing header or any non-`Payment` scheme is treated as "no PoP
-    // attempt" → 402 with the encoded challenge. This matches RFC 7235
-    // §3.1 semantics: a 402 advertises which schemes the resource
-    // accepts; clients that try a different scheme effectively didn't
-    // try.
+    // Step 1: client must present an `Authorization: Payment <blob>`
+    // header. Missing header or any non-`Payment` scheme is treated as
+    // "no payment attempt" → 402 with a fresh challenge. RFC 7235 §3.1
+    // semantics: a 402 advertises which schemes the resource accepts;
+    // clients that try a different scheme effectively didn't try.
     let Some(header_raw) = req.headers().get(http::header::AUTHORIZATION) else {
-        return challenge_response(&ctx.requirement);
+        return challenge_response(&ctx.requirement, None);
     };
 
     // Step 2: header must be valid UTF-8. Per RFC 7230 header values
     // are ASCII; a non-UTF-8 value never carries a valid Payment auth
-    // envelope, so we surface 400 rather than treating it as "no
-    // header".
+    // envelope. Draft §4.2: validation failures get 402 + re-challenge.
     let header_value = match header_raw.to_str() {
         Ok(v) => v,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "invalid Authorization header encoding",
-            )
-                .into_response();
+            return challenge_response(
+                &ctx.requirement,
+                Some("invalid Authorization header encoding"),
+            );
         }
     };
 
-    // Step 3: parse the MPP envelope. `UnknownScheme` is the one
-    // non-error error: it means "the client used Basic/Bearer/whatever
-    // — they didn't try MPP-Cashu", which is identical from a control-
-    // flow perspective to "no header at all". Every other parse error
-    // is "tried Payment but malformed" → 400.
-    let token_value = match parse_payment_authorization(header_value) {
-        Ok(t) => t,
-        Err(AuthParseError::UnknownScheme) => return challenge_response(&ctx.requirement),
-        Err(e) => return auth_parse_error_to_response(e),
+    // Step 3: parse the Payment Authentication envelope. `UnknownScheme`
+    // means "the client used Basic/Bearer/whatever — they didn't try
+    // Payment", which is identical from a control-flow perspective to
+    // "no header at all". Every other parse error is a validation
+    // failure and must be a 402 re-challenge.
+    let credentials = match parse_payment_authorization(header_value) {
+        Ok(c) => c,
+        Err(AuthParseError::UnknownScheme) => {
+            return challenge_response(&ctx.requirement, None);
+        }
+        Err(e) => return challenge_response(&ctx.requirement, Some(&e.to_string())),
     };
 
-    // Step 4: decode the token. `decode_token` already rejects empty
-    // input, unknown prefix, and malformed payload — we just propagate.
-    let token = match decode_token(&token_value) {
+    // Step 4: decode the token from the payload. `decode_token` rejects
+    // empty input, unknown prefix, and malformed payload — draft §4.2
+    // says all of these go to a 402 re-challenge.
+    let token = match decode_token(&credentials.payload.cashu_token) {
         Ok(t) => t,
-        Err(e) => return decode_error_to_response(e),
+        Err(e) => {
+            return challenge_response(&ctx.requirement, Some(&decode_error_message(&e)));
+        }
     };
 
-    // Step 5: run the full validator pipeline. Structural and mint-side
-    // failures both produce HTTP errors per NUT-24 §"Errors".
+    // Step 5: run the full validator pipeline. Validation failures map
+    // to 402 per draft §4.2; only transport-level failures to reach the
+    // mint become 503.
     let validated = match ctx.validator.validate(&token, &ctx.requirement).await {
         Ok(v) => v,
-        Err(e) => return validation_error_to_response(e),
+        Err(e) => return validation_error_to_response(e, &ctx.requirement),
     };
 
     // Step 6: hand the validated PoP to downstream handlers. They can
@@ -159,84 +176,109 @@ where
     next.run(req).await
 }
 
-/// Build a 402 response carrying the encoded challenge in
-/// `WWW-Authenticate: Payment method="cashu", challenge="creqA…"`.
-fn challenge_response(requirement: &PopRequirement) -> Response {
-    let encoded = encode_challenge(requirement);
-    // `encode_challenge` outputs `creqA…` which is base64url —
-    // strictly ASCII printable, no `"` or `\` to escape. Building the
-    // header value via plain concatenation is safe; we still call
-    // `HeaderValue::from_str` to enforce the ASCII invariant in case a
-    // future encoder change breaks it.
-    let header = format!(
-        r#"{} {}="{}", {}="{}""#,
-        PAYMENT_SCHEME, METHOD_PARAM, CASHU_METHOD, CHALLENGE_PARAM, encoded
-    );
-    match HeaderValue::from_str(&header) {
-        Ok(hv) => (
-            StatusCode::PAYMENT_REQUIRED,
-            [(http::header::WWW_AUTHENTICATE, hv)],
-        )
-            .into_response(),
-        // Defensive fallback — only triggers if the encoder regresses.
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to encode WWW-Authenticate challenge header",
-        )
-            .into_response(),
-    }
-}
-
-/// Map an [`AuthParseError`] (from the MPP envelope parser) to an HTTP
-/// response. `UnknownScheme` is handled upstream (→ 402); the rest are
-/// client malformed-header errors → 400.
-fn auth_parse_error_to_response(e: AuthParseError) -> Response {
-    debug_assert!(
-        !matches!(e, AuthParseError::UnknownScheme),
-        "UnknownScheme must be handled upstream as 402"
-    );
-    let msg = format!("invalid Authorization: Payment header: {e}");
-    (StatusCode::BAD_REQUEST, msg).into_response()
-}
-
-/// Map a [`ChallengeError`] (from [`decode_token`]) to an HTTP response.
+/// Build a 402 response carrying a fresh Payment Authentication
+/// challenge. Always emits `Cache-Control: no-store` per draft §11.10.
 ///
-/// All variants are client-attributable (bad header) so they all map to
-/// 400 with a short message. We preserve the variant in the message so
-/// clients can distinguish "wrong prefix" from "bad payload".
-fn decode_error_to_response(e: ChallengeError) -> Response {
-    let msg = match &e {
+/// `failure_reason`, when provided, becomes the response body — it
+/// lets the client see why the previous attempt was rejected. A bare
+/// "no attempt yet" 402 (the client never sent an `Authorization`
+/// header) gets an empty body.
+fn challenge_response(requirement: &PopRequirement, failure_reason: Option<&str>) -> Response {
+    // Per draft §5.1.1 `id` is a "Unique challenge identifier".
+    // Operators that want stateless binding compute `id =
+    // HMAC(secret, params)` per §5.1.2.1 — that's a SHOULD and skipped
+    // here. A random UUIDv4 satisfies the "unique" MUST.
+    let id = Uuid::new_v4().to_string();
+
+    let creq_a = encode_challenge(requirement);
+    let request_envelope = encode_request_envelope(&creq_a);
+
+    // TODO(operator-configurable): wire `realm` through middleware
+    // state once an operator-side config story lands. For v1 a fixed
+    // identifier is fine — the draft only requires the parameter be
+    // present and meaningful.
+    let realm = DEFAULT_REALM;
+
+    let header = format!(
+        r#"{} id="{}", realm="{}", method="cashu", intent="{}", request="{}""#,
+        PAYMENT_SCHEME, id, realm, INTENT_CHARGE, request_envelope,
+    );
+
+    // All values produced above are base64url-nopad alphabet or
+    // ASCII-printable. `HeaderValue::from_str` still validates as a
+    // belt-and-braces guard against a future encoder regression.
+    let www_auth = match HeaderValue::from_str(&header) {
+        Ok(hv) => hv,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode WWW-Authenticate challenge header",
+            )
+                .into_response();
+        }
+    };
+
+    let cache_control = HeaderValue::from_static("no-store");
+
+    let body = failure_reason.unwrap_or("").to_string();
+
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        [
+            (http::header::WWW_AUTHENTICATE, www_auth),
+            (http::header::CACHE_CONTROL, cache_control),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Format a [`ChallengeError`] (from [`decode_token`]) as a short
+/// description suitable for the 402 response body.
+fn decode_error_message(e: &ChallengeError) -> String {
+    match e {
         ChallengeError::InvalidHeader(_) => format!("invalid token value: {e}"),
         ChallengeError::DecodeFailed(_) => format!("decode failed: {e}"),
         // EncodeFailed never originates from decode_token, but the
-        // ChallengeError enum is shared — surface it as a 400 if it
-        // ever leaks through.
+        // ChallengeError enum is shared.
         ChallengeError::EncodeFailed(_) => format!("encode failed: {e}"),
-    };
-    (StatusCode::BAD_REQUEST, msg).into_response()
+    }
 }
 
-/// Map a [`ValidationError`] to an HTTP response per NUT-24 §"Errors":
+/// Map a [`ValidationError`] to an HTTP response.
 ///
-/// > Servers return HTTP 400 if tokens come from unauthorized mints,
-/// > use incorrect units, provide insufficient amounts, or lack proper
-/// > locking conditions.
-///
-/// Transport failures (mint unreachable) are mapped to 503 so clients
-/// see a transient signal — the client may retry the same proof later.
-/// All other validation errors are 400 (client must obtain a new
-/// token).
-fn validation_error_to_response(e: ValidationError) -> Response {
-    let status = match &e {
-        ValidationError::MintUnreachable(_) => StatusCode::SERVICE_UNAVAILABLE,
+/// Per draft §4.2 all validation failures get `402 Payment Required`
+/// with a fresh `WWW-Authenticate: Payment` re-challenge — the client
+/// should try again with a better proof. Only transport-level failures
+/// to reach the mint get `503 Service Unavailable`, since the draft
+/// does not constrain backend failure modes.
+fn validation_error_to_response(e: ValidationError, requirement: &PopRequirement) -> Response {
+    match &e {
+        // Transport failure → backend issue, surface 503 so the client
+        // can choose to retry the same proof later.
+        ValidationError::MintUnreachable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
+        }
+        // Every other failure is a validation failure → 402 +
+        // re-challenge.
         ValidationError::UnitMismatch { .. }
         | ValidationError::MintNotAllowed { .. }
         | ValidationError::AmountInsufficient { .. }
         | ValidationError::TokenEmpty
         | ValidationError::MalformedToken(_)
-        | ValidationError::MintRejectedSwap(_) => StatusCode::BAD_REQUEST,
-    };
-    (status, e.to_string()).into_response()
+        | ValidationError::MintRejectedSwap(_) => {
+            challenge_response(requirement, Some(&e.to_string()))
+        }
+    }
+}
+
+/// Pluck the echoed challenge fields out of a successfully-parsed
+/// credentials blob. Surfaced for test helpers; the middleware itself
+/// doesn't need to consult them past the `method` check that
+/// [`parse_payment_authorization`] already did.
+#[allow(dead_code)]
+pub(crate) fn echoed_challenge_for_test(creds: &crate::auth_header::PaymentCredentials) -> &EchoedChallenge {
+    &creds.challenge
 }
 
 #[cfg(test)]
@@ -259,16 +301,14 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::auth_header::{
+        encode_payment_credentials, CashuPayload, PaymentCredentials,
+    };
     use crate::challenge::PopRequirement;
     use crate::mint_client::{MintClient, MintClientError};
     use crate::validator::{PopValidator, ValidatedPop};
 
     // ---- Mock MintClient (mirrors the validator's test helper) -------
-    //
-    // Kept duplicated rather than reaching into validator::tests so that
-    // Commit 5 changes nothing in validator.rs. The two mocks may diverge
-    // later (e.g. middleware tests may want call-count probes that the
-    // validator tests don't need).
 
     enum SwapResponse {
         Echo,
@@ -292,7 +332,6 @@ mod tests {
             &self,
             _mint_url: &MintUrl,
         ) -> Result<Vec<KeySetInfo>, MintClientError> {
-            // V0 proofs in these tests; empty list is fine.
             Ok(Vec::new())
         }
 
@@ -389,13 +428,29 @@ mod tests {
             .expect("build request with header")
     }
 
-    /// Wrap a raw `cashuB…` token in the MPP-Cashu envelope.
+    /// Wrap a raw `cashuB…` token in the Payment Authentication
+    /// envelope, echoing a fake-but-shapely challenge. The middleware
+    /// does not currently validate that `challenge.id` matches what it
+    /// previously issued (binding is SHOULD, skipped per directive), so
+    /// any well-formed echo works.
     fn payment_header_with_token(token: &str) -> String {
-        format!(r#"Payment method="cashu", token="{token}""#)
+        let creds = PaymentCredentials {
+            challenge: EchoedChallenge {
+                id: "test-challenge-id".into(),
+                realm: DEFAULT_REALM.into(),
+                method: "cashu".into(),
+                intent: INTENT_CHARGE.into(),
+                request: "echoed-request-envelope".into(),
+            },
+            payload: CashuPayload {
+                cashu_token: token.into(),
+            },
+        };
+        format!("Payment {}", encode_payment_credentials(&creds))
     }
 
     /// Build a GET /gated request whose `Authorization` header is the
-    /// MPP envelope around `token`.
+    /// Payment Authentication envelope around `token`.
     fn request_with_token(token: &str) -> HttpRequest<Body> {
         request_with_authorization(&payment_header_with_token(token))
     }
@@ -414,36 +469,125 @@ mod tests {
         req
     }
 
-    // ---- Tests -------------------------------------------------------
+    /// Pluck the `WWW-Authenticate` header off a response as a string
+    /// — convenience for the many tests that assert on its shape.
+    fn www_authenticate(response: &Response) -> String {
+        response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate present")
+            .to_str()
+            .expect("WWW-Authenticate is ASCII")
+            .to_string()
+    }
+
+    // ---- Core 402 challenge shape ------------------------------------
 
     #[tokio::test]
     async fn no_authorization_header_returns_402_with_www_authenticate() {
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app.oneshot(bare_request()).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        let header = response
-            .headers()
-            .get(http::header::WWW_AUTHENTICATE)
-            .expect("WWW-Authenticate header present on 402");
-        let header_str = header.to_str().expect("WWW-Authenticate is ASCII");
+        let header = www_authenticate(&response);
+        // Cover all five MUST fields from draft §5.1.1.
+        assert!(header.starts_with("Payment "), "got: {header}");
+        assert!(header.contains(r#"id=""#), "missing id: {header}");
+        assert!(header.contains(r#"realm=""#), "missing realm: {header}");
         assert!(
-            header_str.starts_with(r#"Payment method="cashu", challenge="creqA"#),
-            "expected MPP-Cashu envelope, got {header_str}"
+            header.contains(r#"method="cashu""#),
+            "missing method=cashu: {header}"
         );
         assert!(
-            header_str.ends_with('"'),
-            "challenge value must be quoted-string-terminated, got {header_str}"
+            header.contains(r#"intent="charge""#),
+            "missing intent=charge: {header}"
         );
-        // Confirm no legacy X-Cashu header leaks onto the 402.
+        assert!(header.contains(r#"request=""#), "missing request: {header}");
+    }
+
+    #[tokio::test]
+    async fn www_authenticate_includes_id_realm_method_intent_request() {
+        // Dedicated MUST-coverage test: each draft §5.1.1 required
+        // field appears with a non-empty value.
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(bare_request()).await.expect("oneshot");
+        let header = www_authenticate(&response);
+
+        for (field, prefix) in &[
+            ("id", r#"id=""#),
+            ("realm", r#"realm=""#),
+            ("method", r#"method=""#),
+            ("intent", r#"intent=""#),
+            ("request", r#"request=""#),
+        ] {
+            let start = header
+                .find(prefix)
+                .unwrap_or_else(|| panic!("missing {field} param in {header}"));
+            let rest = &header[start + prefix.len()..];
+            let end = rest
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated {field} param in {header}"));
+            let value = &rest[..end];
+            assert!(
+                !value.is_empty(),
+                "{field} value must be non-empty in {header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn realm_default_is_cdk_pop_verifier() {
+        // Lock the default `realm` so an operator-configurable change
+        // later is a visible diff. Doc-comment on DEFAULT_REALM
+        // explains the operator-configurable plan.
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(bare_request()).await.expect("oneshot");
+        let header = www_authenticate(&response);
         assert!(
-            response.headers().get("x-cashu").is_none(),
-            "X-Cashu must not be emitted in MPP-only mode"
+            header.contains(r#"realm="cdk-pop-verifier""#),
+            "got: {header}"
         );
     }
 
     #[tokio::test]
+    async fn www_authenticate_request_is_base64url_nopad_envelope() {
+        // The `request` param's contents are base64url-nopad encoded
+        // JSON `{ "cashu_request": "creqA..." }` — confirm the encoded
+        // string round-trips back to a creqA payload.
+        use crate::challenge::decode_request_envelope;
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(bare_request()).await.expect("oneshot");
+        let header = www_authenticate(&response);
+        let start = header.find(r#"request=""#).expect("has request param");
+        let after = &header[start + r#"request=""#.len()..];
+        let end = after.find('"').expect("terminated request param");
+        let request_value = &after[..end];
+        let creq_a = decode_request_envelope(request_value).expect("decodes envelope");
+        assert!(
+            creq_a.starts_with("creqA"),
+            "envelope must wrap a creqA payload, got: {creq_a}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_402_has_cache_control_no_store() {
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(bare_request()).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let cache = response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .expect("Cache-Control present on 402");
+        assert_eq!(
+            cache.to_str().expect("ASCII"),
+            "no-store",
+            "draft §11.10 MUST: Cache-Control: no-store on 402"
+        );
+    }
+
+    // ---- Happy path --------------------------------------------------
+
+    #[tokio::test]
     async fn valid_token_passes_through_to_handler() {
-        // Token exactly matches the requirement: pop_unit, mint_a, amount=10.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -458,11 +602,6 @@ mod tests {
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
 
-        // The handler reads ValidatedPop out of extensions and echoes
-        // the amount. If the extension was missing the handler would
-        // have failed to extract and the response status would not be
-        // 200, but we additionally assert the body to prove the
-        // ValidatedPop reached the handler intact.
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
@@ -470,33 +609,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_header_encoding_returns_400() {
+    async fn authorization_blob_echoes_challenge_id() {
+        // The middleware does not enforce binding (SHOULD, skipped),
+        // but the round-trip must work: we hand the server a credentials
+        // blob with our test id, get 200, and the handler runs.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let encoded = token.to_string();
+
+        let creds = PaymentCredentials {
+            challenge: EchoedChallenge {
+                id: "echoed-id-from-client".into(),
+                realm: DEFAULT_REALM.into(),
+                method: "cashu".into(),
+                intent: INTENT_CHARGE.into(),
+                request: "echoed-request".into(),
+            },
+            payload: CashuPayload {
+                cashu_token: encoded,
+            },
+        };
+        let header = format!("Payment {}", encode_payment_credentials(&creds));
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(&header))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ---- Validation-failure mapping (all → 402 + re-challenge) -------
+
+    #[tokio::test]
+    async fn invalid_header_encoding_returns_402() {
         // 0xFF is not valid UTF-8.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_raw_authorization(&[0xFFu8, 0xFE, 0xFD]))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body_bytes = to_bytes(response.into_body(), 1024)
-            .await
-            .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            body.contains("invalid Authorization header encoding"),
-            "unexpected body: {body}"
-        );
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        // Must come with a fresh re-challenge per draft §4.2.
+        assert!(response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_some());
     }
 
     #[tokio::test]
-    async fn malformed_token_returns_400() {
-        // Recognized prefix, garbage payload — Error::DecodeFailed path.
+    async fn malformed_token_returns_402() {
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_token("cashuB!!!notbase64!!!"))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
@@ -508,8 +675,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unit_mismatch_returns_400() {
-        // Token uses CurrencyUnit::Sat but the requirement expects pop_unit.
+    async fn validation_failure_returns_402_not_400() {
+        // The flagship draft §4.2 test: a structurally-OK but
+        // unit-mismatched token must come back as 402 + re-challenge,
+        // NOT 400.
         let token = make_token(mint_a(), CurrencyUnit::Sat, vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -518,21 +687,35 @@ mod tests {
             .oneshot(request_with_token(&encoded))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        // Fresh challenge present.
+        let header = www_authenticate(&response);
+        assert!(header.contains(r#"method="cashu""#));
+        // Cache-Control still no-store.
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .expect("Cache-Control")
+                .to_str()
+                .unwrap(),
+            "no-store"
+        );
+        // Body explains the failure.
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
             body.contains("does not match requirement unit"),
-            "expected unit-mismatch message, got: {body}"
+            "expected unit-mismatch body, got: {body}"
         );
     }
 
     #[tokio::test]
     async fn mint_unreachable_returns_503() {
-        // Structurally valid token, but the mock swap surfaces
-        // MintClientError::Unreachable. Middleware must translate to 503.
+        // Transport failure: stays as 503 per the comments on
+        // validation_error_to_response.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -553,10 +736,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_rejected_returns_400() {
-        // Structurally valid token; mock swap returns RejectedSwap
-        // (expired credential, double-spent, etc.). Middleware must
-        // surface as 400 per NUT-24 §"Errors".
+    async fn mint_rejected_returns_402() {
+        // Swap rejected (expired, double-spent, etc.) is a *validation*
+        // failure per draft §4.2 — 402 with a fresh re-challenge so the
+        // client can try a different proof.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -565,7 +748,7 @@ mod tests {
             .oneshot(request_with_token(&encoded))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
@@ -576,86 +759,157 @@ mod tests {
         );
     }
 
-    // ---- MPP envelope parsing tests ----------------------------------
+    // ---- Envelope-shape rejection (legacy param form etc.) -----------
 
     #[tokio::test]
-    async fn non_payment_scheme_returns_402() {
-        // `Authorization: Bearer …` is not an MPP-Cashu attempt at all.
-        // RFC 7235 §3.1 lets the server treat unsupported schemes as
-        // "credentials not presented" — same flow as a missing header.
+    async fn non_payment_scheme_returns_402_with_no_failure_body() {
+        // RFC 7235 §3.1: unsupported scheme is identical to no
+        // attempt. Body should be empty (no failure to describe).
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_authorization("Bearer abcdef"))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        let header = response
-            .headers()
-            .get(http::header::WWW_AUTHENTICATE)
-            .expect("challenge re-issued on non-Payment scheme");
-        assert!(header
-            .to_str()
-            .unwrap()
-            .starts_with(r#"Payment method="cashu""#));
-    }
-
-    #[tokio::test]
-    async fn payment_with_wrong_method_returns_400() {
-        // `Payment` scheme is right but the method extension isn't
-        // ours — middleware must reject (400) instead of re-challenging.
-        let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_authorization(
-                r#"Payment method="tempo", token="cashuBabc""#,
-            ))
-            .await
-            .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let header = www_authenticate(&response);
+        assert!(header.starts_with(r#"Payment id=""#));
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
-            body.contains("method must be 'cashu'"),
+            body_bytes.is_empty(),
+            "bare 402 (no attempt) should have empty body, got: {body_bytes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_must_be_opaque_base64url_blob() {
+        // The transitional `method="cashu", token="..."` param form is
+        // no longer accepted — base64 decode trips → 402 re-challenge.
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(
+                r#"Payment method="cashu", token="cashuBabc""#,
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn base64url_decode_failure_returns_402() {
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization("Payment !!!notbase64!!!"))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
+        assert!(
+            body.contains("base64url"),
+            "expected base64 error message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_parse_failure_returns_402() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let blob = URL_SAFE_NO_PAD.encode(b"not a json object at all");
+        let header = format!("Payment {blob}");
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(&header))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
+        assert!(
+            body.contains("JSON is malformed"),
+            "expected JSON error message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_missing_challenge_field_returns_402() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"cashu_token":"cashuBabc"}}"#);
+        let header = format!("Payment {blob}");
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(&header))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn json_missing_payload_field_returns_402() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let blob = URL_SAFE_NO_PAD.encode(
+            br#"{"challenge":{"id":"a","realm":"b","method":"cashu","intent":"charge","request":"r"}}"#,
+        );
+        let header = format!("Payment {blob}");
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(&header))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn wrong_method_returns_402() {
+        // `Payment` scheme + valid envelope + `method="tempo"` →
+        // validation failure → 402 re-challenge.
+        let creds = PaymentCredentials {
+            challenge: EchoedChallenge {
+                id: "id".into(),
+                realm: "r".into(),
+                method: "tempo".into(),
+                intent: "charge".into(),
+                request: "r".into(),
+            },
+            payload: CashuPayload {
+                cashu_token: "cashuBabc".into(),
+            },
+        };
+        let header = format!("Payment {}", encode_payment_credentials(&creds));
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_authorization(&header))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
+        assert!(
+            body.contains("must be 'cashu'"),
             "expected wrong-method message, got: {body}"
         );
     }
 
     #[tokio::test]
-    async fn payment_with_missing_token_returns_400() {
+    async fn payment_with_empty_credentials_returns_402() {
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
-            .oneshot(request_with_authorization(r#"Payment method="cashu""#))
+            .oneshot(request_with_authorization("Payment"))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body_bytes = to_bytes(response.into_body(), 1024)
-            .await
-            .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            body.contains("missing 'token'"),
-            "expected missing-token message, got: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn payment_with_missing_method_returns_400() {
-        let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_authorization(
-                r#"Payment token="cashuBabc""#,
-            ))
-            .await
-            .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body_bytes = to_bytes(response.into_body(), 1024)
-            .await
-            .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            body.contains("missing 'method'"),
-            "expected missing-method message, got: {body}"
-        );
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     }
 }

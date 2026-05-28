@@ -2,10 +2,10 @@
 //!
 //! `PopRequirement` is the verifier-side description of what a holder must
 //! present: a Cashu mint set, unit, amount and metadata. `encode_challenge`
-//! serializes it into the `creqA...` string the server places in the
-//! `X-Cashu` header of a 402 response (NUT-18 CREQ-A wire format, used by
-//! NUT-24). `decode_token` parses the `cashuB...` token the client returns
-//! in the same `X-Cashu` header on retry.
+//! serializes it into the `creqA...` string the server uses inside the
+//! draft-httpauth-payment-00 `request` auth-param on the 402 response.
+//! `decode_token` parses the `cashuB...` token the client returns inside
+//! the credentials payload on retry.
 //!
 //! Transports are intentionally left empty: NUT-24 is in-band over HTTP, so
 //! no separate Nostr/HTTPS transport hop is advertised. `nut10` is left
@@ -14,7 +14,17 @@
 //! `PopRequirement.unit` is expected to be `CurrencyUnit::Custom("pop_<ts>")`
 //! for PoP credentials, but this module does not enforce the prefix — it
 //! only round-trips whatever unit the caller supplies.
+//!
+//! ## Request envelope
+//!
+//! draft-httpauth-payment-00 §5.1.1 requires the `request` auth-param to be
+//! a base64url-nopad-encoded JSON blob. For the cashu method we wrap our
+//! NUT-18 `creqA…` string inside that JSON as a single `cashu_request`
+//! field. [`encode_request_envelope`] does the wrap; the client unwraps
+//! it after base64url-decoding the auth-param value.
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use cashu::nuts::nut18::PaymentRequest;
 use cashu::nuts::CurrencyUnit;
 use cashu::{Amount, MintUrl, Token};
@@ -65,12 +75,53 @@ impl PopRequirement {
 }
 
 /// Encode a `PopRequirement` into the `creqA...` string that becomes the
-/// `X-Cashu` header value of a 402 response.
+/// `cashu_request` field inside the draft-httpauth-payment-00 `request`
+/// auth-param on a 402 response.
 ///
 /// Cannot fail: NUT-18 CBOR + base64url encoding of these fields is
 /// infallible in `cashu` 0.16.
 pub fn encode_challenge(req: &PopRequirement) -> String {
     req.to_payment_request().to_string()
+}
+
+/// JSON envelope carried inside the WWW-Authenticate `request`
+/// auth-param. draft-httpauth-payment-00 §5.1.1 mandates a
+/// base64url-nopad-encoded JSON object for this parameter; for the
+/// cashu method we put the NUT-18 `creqA…` string in a single
+/// `cashu_request` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RequestEnvelope {
+    cashu_request: String,
+}
+
+/// Wrap a NUT-18 `creqA…` string in the draft-httpauth-payment-00
+/// `request` envelope and base64url-nopad-encode it.
+///
+/// The returned string is what goes inside the `request="…"` auth-param
+/// of `WWW-Authenticate: Payment`. Cannot fail.
+pub fn encode_request_envelope(creq_a: &str) -> String {
+    let envelope = RequestEnvelope {
+        cashu_request: creq_a.to_string(),
+    };
+    let json = serde_json::to_string(&envelope)
+        .expect("RequestEnvelope always serializes");
+    URL_SAFE_NO_PAD.encode(json.as_bytes())
+}
+
+/// Unwrap the base64url-nopad-encoded `request` envelope and return the
+/// inner `cashu_request` string (which should be a `creqA…` NUT-18
+/// payment-request).
+///
+/// Returns an error if the envelope cannot be base64-decoded, is not
+/// valid UTF-8/JSON, or lacks the `cashu_request` field. Provided for
+/// symmetry + downstream client use; the middleware does not call this.
+pub fn decode_request_envelope(b64: &str) -> Result<String, Error> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(b64.trim())
+        .map_err(|e| Error::DecodeFailed(format!("request envelope base64: {e}")))?;
+    let envelope: RequestEnvelope = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::DecodeFailed(format!("request envelope json: {e}")))?;
+    Ok(envelope.cashu_request)
 }
 
 /// Decode the `X-Cashu` header value carrying a `cashuB...` token on a
@@ -205,5 +256,44 @@ mod tests {
             matches!(err, Error::DecodeFailed(_)),
             "expected DecodeFailed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn request_envelope_roundtrips() {
+        let req = sample_requirement();
+        let creq = encode_challenge(&req);
+        let envelope = encode_request_envelope(&creq);
+        let unwrapped = decode_request_envelope(&envelope)
+            .expect("request envelope round-trips");
+        assert_eq!(unwrapped, creq);
+    }
+
+    #[test]
+    fn request_envelope_is_base64url_nopad() {
+        let envelope = encode_request_envelope("creqAdummy");
+        // base64url-nopad alphabet excludes '+', '/', '='. Confirm none
+        // of those leak through.
+        for c in envelope.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "envelope contains non-base64url char {c:?}: {envelope}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_request_envelope_rejects_bad_base64() {
+        let err = decode_request_envelope("!!!notbase64!!!")
+            .expect_err("bad base64");
+        assert!(matches!(err, Error::DecodeFailed(_)));
+    }
+
+    #[test]
+    fn decode_request_envelope_rejects_missing_field() {
+        // Valid base64 + valid JSON, but no `cashu_request`.
+        let bad = URL_SAFE_NO_PAD.encode(br#"{"other":"x"}"#);
+        let err = decode_request_envelope(&bad)
+            .expect_err("missing cashu_request");
+        assert!(matches!(err, Error::DecodeFailed(_)));
     }
 }

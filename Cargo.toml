@@ -44,3 +44,12 @@ tower = "0.5"
 # on …" log line and pick up `RUST_LOG=…` via the env-filter feature.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# `base64` 0.22 (URL_SAFE_NO_PAD engine) implements the draft-httpauth-payment-00
+# `request` and credentials envelopes. Already transitively pulled in by
+# reqwest/hyper-util so adding it as a direct workspace dep does not
+# enlarge the build graph.
+base64 = "0.22"
+# `uuid` v4 generates the per-request challenge `id` value the draft mandates
+# on `WWW-Authenticate: Payment`. The `v4` feature wires up the random-uuid
+# constructor; `cashu` already pulls the same crate transitively.
+uuid = { version = "1", features = ["v4"] }
